@@ -176,6 +176,7 @@ def iter_pst_messages(pst_path, progress_cb=None):
         raise RuntimeError(
             "未安装 pypff 库，请先执行: pip install libpff-python-windows")
 
+    pst_path = os.path.normpath(os.path.abspath(pst_path))
     pst_file = pypff.file()
     pst_file.open(pst_path)
     root = pst_file.get_root_folder()
@@ -398,6 +399,7 @@ class App(tk.Tk):
         path = filedialog.askopenfilename(
             title="选择 PST 文件", filetypes=[("Outlook 数据文件", "*.pst"), ("所有文件", "*.*")])
         if path:
+            path = os.path.normpath(path)
             self.pst_path_var.set(path)
             if not self.output_dir_var.get():
                 self.output_dir_var.set(os.path.join(os.path.dirname(path), "搜索结果"))
@@ -405,7 +407,7 @@ class App(tk.Tk):
     def choose_output(self):
         path = filedialog.askdirectory(title="选择结果输出文件夹")
         if path:
-            self.output_dir_var.set(path)
+            self.output_dir_var.set(os.path.normpath(path))
 
     def parse_date(self, s):
         s = s.strip()
