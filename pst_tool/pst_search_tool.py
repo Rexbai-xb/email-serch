@@ -41,6 +41,53 @@ except ImportError:
 # 核心：PST 解析与搜索逻辑
 # ----------------------------------------------------------------------
 
+# ----------------------------------------------------------------------
+# 主题标准化：去除"回复:"/"转发:"/"RE:"/"[External]"等前缀，
+# 让同一个邮件会话（线程）能被识别为"同一主题"，而不是因为回复/转发
+# 加了前缀就被当成不同的主题。规则取自用户提供的《邮件检索设置》表。
+# ----------------------------------------------------------------------
+
+_RAW_SUBJECT_NOISE_PREFIXES = [
+    '回复:', '回复：', '回复_', '回复-', '回复 ', '回复\u3000',
+    '转发:', '转发：', '转发_', '转发-', '转发 ', '转发\u3000',
+    'RE:', 'RE：', 'RE_', 'RE-', 'RE ',
+    'Re:', 'Re：', 'Re_', 'Re-', 'Re ',
+    'FW:', 'FW：', 'FW_', 'FW-', 'FW ',
+    'Fw:', 'Fw：', 'Fw_', 'Fw-', 'Fw ',
+    '以此为准',
+    'Recall:', 'Recall：', 'Recall_', 'Recall-', 'Recall ',
+    'Update_', 'Update:', 'Update：', 'Update-', 'Update ',
+    'Updated_', 'Updated:', 'Updated：', 'Updated-', 'Updated ',
+    '答复_', '答复:', '答复：', '答复-', '答复 ', '答复\u3000',
+    '更新_', '更新:', '更新：', '更新-', '更新 ', '更新\u3000',
+    '[External]',
+]
+# 按长度从长到短排序、去重，避免短前缀抢先误匹配
+SUBJECT_NOISE_PREFIXES = sorted(set(_RAW_SUBJECT_NOISE_PREFIXES), key=len, reverse=True)
+
+
+def normalize_subject(subject):
+    """
+    反复剥除主题开头的 回复/转发/RE/FW/[External] 等标记，
+    直到剥不动为止，得到"核心主题"，用于识别同一封邮件的会话线程。
+    例如：
+        "[External] Re: 转发: SABIC FUJIAN HDPE- 配管范围"
+        -> "SABIC FUJIAN HDPE- 配管范围"
+    """
+    s = (subject or "").strip()
+    for _ in range(15):  # 最多剥15层前缀，防止极端情况死循环
+        changed = False
+        for prefix in SUBJECT_NOISE_PREFIXES:
+            plen = len(prefix)
+            if plen and len(s) >= plen and s[:plen].casefold() == prefix.casefold():
+                s = s[plen:].lstrip()
+                changed = True
+                break
+        if not changed:
+            break
+    return s or (subject or "").strip()
+
+
 class SearchCriteria:
     """搜索条件"""
     def __init__(self, subject_kw="", from_kw="", to_kw="",
@@ -61,6 +108,7 @@ class MailRecord:
     def __init__(self, folder_path, message):
         self.folder_path = folder_path
         self.subject = safe_str(getattr(message, "subject", None))
+        self.normalized_subject = normalize_subject(self.subject)
         self.sender_name = safe_str(getattr(message, "sender_name", None))
         self.display_to = safe_str(getattr(message, "display_to", None))
         self.display_cc = safe_str(getattr(message, "display_cc", None))
@@ -71,7 +119,8 @@ class MailRecord:
         self.transport_headers = safe_str(getattr(message, "transport_headers", None))
 
     def matches(self, criteria: SearchCriteria):
-        if criteria.subject_kw and criteria.subject_kw not in self.subject.lower():
+        if criteria.subject_kw and criteria.subject_kw not in self.subject.lower() \
+                and criteria.subject_kw not in self.normalized_subject.lower():
             return False
         if criteria.from_kw and criteria.from_kw not in self.sender_name.lower() \
                 and criteria.from_kw not in self.transport_headers.lower():
@@ -229,7 +278,9 @@ def run_search(pst_path, criteria: SearchCriteria, status_cb=None):
 
 def export_results(matched, total, output_dir, export_eml=True, status_cb=None):
     """
-    生成 Excel 报表 + 导出匹配邮件为 .eml 文件
+    生成 Excel 报表 + 导出匹配邮件为 .eml 文件。
+    同一个"标准化主题"（去掉 回复/转发/RE/FW/[External] 等前缀后相同）
+    的邮件会被归入同一个子文件夹，而不是各自分散。
     返回报表文件路径
     """
     if openpyxl is None:
@@ -240,11 +291,31 @@ def export_results(matched, total, output_dir, export_eml=True, status_cb=None):
     if export_eml:
         os.makedirs(eml_dir, exist_ok=True)
 
+    # 按标准化主题分组（同一会话线程的邮件归为一组）
+    groups = {}          # normalized_subject -> [MailRecord, ...]
+    group_order = []     # 保持首次出现的顺序
+    for rec in matched:
+        key = rec.normalized_subject or "(无主题)"
+        if key not in groups:
+            groups[key] = []
+            group_order.append(key)
+        groups[key].append(rec)
+
+    # 组内按时间排序，方便看出"最早-最新"
+    for key in groups:
+        groups[key].sort(key=lambda r: (r.date is None, r.date))
+
+    # 为每个分组生成一个安全的文件夹名（加序号前缀防止重名/过长）
+    group_folder_names = {}
+    for g_idx, key in enumerate(group_order, start=1):
+        group_folder_names[key] = f"{g_idx:03d}_{sanitize_filename(key, 60)}"
+
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "搜索结果"
+    ws.title = "搜索结果明细"
 
-    headers = ["序号", "主题", "发件人", "收件人", "抄送", "日期", "所在文件夹", "附件数", "导出文件名"]
+    headers = ["序号", "主题", "标准化主题(线程)", "发件人", "收件人", "抄送",
+               "日期", "所在PST文件夹", "附件数", "导出路径"]
     ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True, color="FFFFFF")
@@ -255,29 +326,61 @@ def export_results(matched, total, output_dir, export_eml=True, status_cb=None):
         if status_cb and idx % 20 == 0:
             status_cb(f"正在导出第 {idx}/{len(matched)} 封匹配邮件 ...")
 
-        eml_filename = ""
+        export_rel_path = ""
         if export_eml:
-            date_prefix = rec.date.strftime("%Y%m%d") if rec.date else "无日期"
-            eml_filename = f"{idx:05d}_{date_prefix}_{sanitize_filename(rec.subject)}.eml"
+            key = rec.normalized_subject or "(无主题)"
+            sub_folder = group_folder_names[key]
+            sub_folder_abs = os.path.join(eml_dir, sub_folder)
+            os.makedirs(sub_folder_abs, exist_ok=True)
+
+            date_prefix = rec.date.strftime("%Y%m%d_%H%M%S") if rec.date else "无日期"
+            eml_filename = f"{date_prefix}_{sanitize_filename(rec.sender_name, 30)}.eml"
             try:
-                with open(os.path.join(eml_dir, eml_filename), "wb") as f:
+                with open(os.path.join(sub_folder_abs, eml_filename), "wb") as f:
                     f.write(rec.to_eml_bytes())
+                export_rel_path = os.path.join("匹配邮件", sub_folder, eml_filename)
             except Exception:
-                eml_filename = "(导出失败)"
+                export_rel_path = "(导出失败)"
 
         ws.append([
             idx,
             rec.subject,
+            rec.normalized_subject,
             rec.sender_name,
             rec.display_to,
             rec.display_cc,
             rec.date.strftime("%Y-%m-%d %H:%M:%S") if rec.date else "",
             rec.folder_path,
             rec.num_attachments,
-            eml_filename,
+            export_rel_path,
         ])
 
-    # 汇总信息 sheet
+    for col, width in zip("ABCDEFGHIJ", [6, 36, 36, 22, 26, 22, 20, 22, 8, 50]):
+        ws.column_dimensions[col].width = width
+
+    # 按主题分组的汇总表：同一线程一行，含最早/最新时间和涉及邮件数
+    ws_group = wb.create_sheet("主题分组汇总")
+    ws_group.append(["序号", "主题(标准化后)", "涉及邮件数", "最早邮件时间",
+                      "最新邮件时间", "涉及发件人", "对应文件夹"])
+    for cell in ws_group[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="4472C4")
+        cell.alignment = Alignment(horizontal="center")
+
+    for g_idx, key in enumerate(group_order, start=1):
+        recs = groups[key]
+        dated = [r.date for r in recs if r.date]
+        earliest = min(dated).strftime("%Y-%m-%d %H:%M:%S") if dated else ""
+        latest = max(dated).strftime("%Y-%m-%d %H:%M:%S") if dated else ""
+        senders = "; ".join(sorted({r.sender_name for r in recs if r.sender_name}))
+        ws_group.append([
+            g_idx, key, len(recs), earliest, latest, senders,
+            group_folder_names[key] if export_eml else "",
+        ])
+    for col, width in zip("ABCDEFG", [6, 40, 10, 20, 20, 35, 30]):
+        ws_group.column_dimensions[col].width = width
+
+    # 统计汇总 sheet
     ws2 = wb.create_sheet("统计汇总")
     match_rate = (len(matched) / total * 100) if total else 0
     summary_rows = [
@@ -285,19 +388,17 @@ def export_results(matched, total, output_dir, export_eml=True, status_cb=None):
         ("PST 中邮件总数", total),
         ("匹配邮件数", len(matched)),
         ("匹配率", f"{match_rate:.2f}%"),
+        ("识别出的主题(线程)数", len(group_order)),
     ]
     for r in summary_rows:
         ws2.append(r)
-    ws2.column_dimensions["A"].width = 20
+    ws2.column_dimensions["A"].width = 22
     ws2.column_dimensions["B"].width = 30
-
-    for col, width in zip("ABCDEFGHI", [8, 40, 25, 30, 25, 20, 25, 8, 45]):
-        ws.column_dimensions[col].width = width
 
     report_path = os.path.join(
         output_dir, f"邮件搜索报表_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
     wb.save(report_path)
-    return report_path, match_rate
+    return report_path, match_rate, len(group_order)
 
 
 # ----------------------------------------------------------------------
@@ -480,7 +581,7 @@ class App(tk.Tk):
             matched, total = run_search(pst_path, criteria, status_cb=self.set_status)
 
             self.set_status(f"扫描完成，共 {total} 封邮件，匹配 {len(matched)} 封。正在生成报表...")
-            report_path, match_rate = export_results(
+            report_path, match_rate, thread_count = export_results(
                 matched, total, output_dir, export_eml=export_eml, status_cb=self.set_status)
 
             self.set_status("完成！")
@@ -488,13 +589,15 @@ class App(tk.Tk):
             self.append_result(f"扫描邮件总数：{total}")
             self.append_result(f"匹配邮件数量：{len(matched)}")
             self.append_result(f"匹配率：{match_rate:.2f}%")
+            self.append_result(f"识别出的主题(线程)数：{thread_count}（已按标准化主题合并 回复/转发/RE/FW 等变体）")
             self.append_result(f"报表文件：{report_path}")
             if export_eml:
-                self.append_result(f"匹配邮件已导出到：{os.path.join(output_dir, '匹配邮件')}")
+                self.append_result(f"匹配邮件已导出到：{os.path.join(output_dir, '匹配邮件')}（按主题分了子文件夹）")
 
             messagebox.showinfo(
                 "搜索完成",
-                f"共扫描 {total} 封邮件，匹配 {len(matched)} 封，匹配率 {match_rate:.2f}%。\n"
+                f"共扫描 {total} 封邮件，匹配 {len(matched)} 封（合并为 {thread_count} 个主题线程），"
+                f"匹配率 {match_rate:.2f}%。\n"
                 f"报表与邮件已保存到：\n{output_dir}")
         except Exception as e:
             traceback.print_exc()
