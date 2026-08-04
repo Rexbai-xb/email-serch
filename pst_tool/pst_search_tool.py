@@ -174,6 +174,32 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
+def win_long_path(path):
+    """
+    给绝对路径加上 Windows 长路径前缀 \\\\?\\，绕过经典的 260 字符路径长度限制。
+    常见于 OneDrive 同步目录 + 长中文主题文件夹名 + 长文件名 叠加导致超限的场景。
+    非 Windows 系统直接原样返回。
+    """
+    if os.name != "nt":
+        return path
+    path = os.path.abspath(path)
+    if path.startswith("\\\\?\\"):
+        return path
+    if path.startswith("\\\\"):  # UNC 网络路径
+        return "\\\\?\\UNC\\" + path[2:]
+    return "\\\\?\\" + path
+
+
+def robust_makedirs(path):
+    """创建目录，自动处理超长路径"""
+    os.makedirs(win_long_path(path), exist_ok=True)
+
+
+def robust_open(path, mode):
+    """打开文件，自动处理超长路径"""
+    return open(win_long_path(path), mode)
+
+
 def safe_str(v):
     if v is None:
         return ""
@@ -286,10 +312,10 @@ def export_results(matched, total, output_dir, export_eml=True, status_cb=None):
     if openpyxl is None:
         raise RuntimeError("未安装 openpyxl 库，请先执行: pip install openpyxl")
 
-    os.makedirs(output_dir, exist_ok=True)
+    robust_makedirs(output_dir)
     eml_dir = os.path.join(output_dir, "匹配邮件")
     if export_eml:
-        os.makedirs(eml_dir, exist_ok=True)
+        robust_makedirs(eml_dir)
 
     # 按标准化主题分组（同一会话线程的邮件归为一组）
     groups = {}          # normalized_subject -> [MailRecord, ...]
@@ -308,7 +334,7 @@ def export_results(matched, total, output_dir, export_eml=True, status_cb=None):
     # 为每个分组生成一个安全的文件夹名（加序号前缀防止重名/过长）
     group_folder_names = {}
     for g_idx, key in enumerate(group_order, start=1):
-        group_folder_names[key] = f"{g_idx:03d}_{sanitize_filename(key, 60)}"
+        group_folder_names[key] = f"{g_idx:03d}_{sanitize_filename(key, 50)}"
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -331,16 +357,16 @@ def export_results(matched, total, output_dir, export_eml=True, status_cb=None):
             key = rec.normalized_subject or "(无主题)"
             sub_folder = group_folder_names[key]
             sub_folder_abs = os.path.join(eml_dir, sub_folder)
-            os.makedirs(sub_folder_abs, exist_ok=True)
-
-            date_prefix = rec.date.strftime("%Y%m%d_%H%M%S") if rec.date else "无日期"
-            eml_filename = f"{date_prefix}_{sanitize_filename(rec.sender_name, 30)}.eml"
             try:
-                with open(os.path.join(sub_folder_abs, eml_filename), "wb") as f:
+                robust_makedirs(sub_folder_abs)
+                date_prefix = rec.date.strftime("%Y%m%d_%H%M%S") if rec.date else "无日期"
+                eml_filename = f"{date_prefix}_{sanitize_filename(rec.sender_name, 24)}.eml"
+                eml_abs_path = os.path.join(sub_folder_abs, eml_filename)
+                with robust_open(eml_abs_path, "wb") as f:
                     f.write(rec.to_eml_bytes())
                 export_rel_path = os.path.join("匹配邮件", sub_folder, eml_filename)
-            except Exception:
-                export_rel_path = "(导出失败)"
+            except Exception as e:
+                export_rel_path = f"(导出失败：{str(e)[:120]})"
 
         ws.append([
             idx,
@@ -361,7 +387,7 @@ def export_results(matched, total, output_dir, export_eml=True, status_cb=None):
     # 按主题分组的汇总表：同一线程一行，含最早/最新时间和涉及邮件数
     ws_group = wb.create_sheet("主题分组汇总")
     ws_group.append(["序号", "主题(标准化后)", "涉及邮件数", "最早邮件时间",
-                      "最新邮件时间", "涉及发件人", "对应文件夹"])
+                      "最新邮件时间", "涉及发件人", "对应文件夹", "快速访问"])
     for cell in ws_group[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="4472C4")
@@ -373,11 +399,17 @@ def export_results(matched, total, output_dir, export_eml=True, status_cb=None):
         earliest = min(dated).strftime("%Y-%m-%d %H:%M:%S") if dated else ""
         latest = max(dated).strftime("%Y-%m-%d %H:%M:%S") if dated else ""
         senders = "; ".join(sorted({r.sender_name for r in recs if r.sender_name}))
+        folder_name = group_folder_names[key] if export_eml else ""
         ws_group.append([
-            g_idx, key, len(recs), earliest, latest, senders,
-            group_folder_names[key] if export_eml else "",
+            g_idx, key, len(recs), earliest, latest, senders, folder_name, "",
         ])
-    for col, width in zip("ABCDEFG", [6, 40, 10, 20, 20, 35, 30]):
+        if export_eml:
+            sub_folder_abs = os.path.abspath(os.path.join(eml_dir, folder_name))
+            link_cell = ws_group.cell(row=ws_group.max_row, column=8)
+            link_cell.value = "打开文件夹"
+            link_cell.hyperlink = "file:///" + sub_folder_abs.replace("\\", "/")
+            link_cell.font = Font(color="0563C1", underline="single")
+    for col, width in zip("ABCDEFGH", [6, 40, 10, 20, 20, 35, 30, 14]):
         ws_group.column_dimensions[col].width = width
 
     # 统计汇总 sheet
@@ -397,7 +429,7 @@ def export_results(matched, total, output_dir, export_eml=True, status_cb=None):
 
     report_path = os.path.join(
         output_dir, f"邮件搜索报表_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-    wb.save(report_path)
+    wb.save(win_long_path(report_path))
     return report_path, match_rate, len(group_order)
 
 
