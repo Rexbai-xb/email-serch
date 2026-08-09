@@ -33,6 +33,7 @@ except ImportError:
 try:
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
 except ImportError:
     openpyxl = None
 
@@ -405,9 +406,10 @@ def export_results(matched, total, output_dir, export_eml=True, status_cb=None):
         ])
         if export_eml:
             sub_folder_abs = os.path.abspath(os.path.join(eml_dir, folder_name))
+            link_url = "file:///" + sub_folder_abs.replace("\\", "/")
             link_cell = ws_group.cell(row=ws_group.max_row, column=8)
             link_cell.value = "打开文件夹"
-            link_cell.hyperlink = "file:///" + sub_folder_abs.replace("\\", "/")
+            link_cell.hyperlink = link_url        # 直接赋字符串，openpyxl 会自动注册到关系
             link_cell.font = Font(color="0563C1", underline="single")
     for col, width in zip("ABCDEFGH", [6, 40, 10, 20, 20, 35, 30, 14]):
         ws_group.column_dimensions[col].width = width
@@ -441,7 +443,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Outlook PST 邮件搜索工具")
-        self.geometry("640x600")
+        self.geometry("660x630")
         self.resizable(False, False)
 
         self.pst_path_var = tk.StringVar()
@@ -466,11 +468,12 @@ class App(tk.Tk):
         pad = {"padx": 10, "pady": 6}
 
         frm_header = ttk.Frame(self)
-        frm_header.pack(fill="x", padx=14, pady=(12, 2))
+        frm_header.pack(fill="x", padx=14, pady=(12, 4))
         if self.logo_img is not None:
             ttk.Label(frm_header, image=self.logo_img).pack(side="left")
         ttk.Label(frm_header, text="Outlook PST 邮件搜索工具",
-                  font=("Microsoft YaHei UI", 12, "bold")).pack(side="left", padx=10)
+                  font=("Microsoft YaHei UI", 11, "bold"),
+                  foreground="#3c3c3c").pack(side="right", padx=4)
 
         frm_file = ttk.LabelFrame(self, text="第一步：选择 PST 文件与输出文件夹")
         frm_file.pack(fill="x", **pad)
@@ -525,6 +528,11 @@ class App(tk.Tk):
         self.result_text = tk.Text(frm_status, height=8, wrap="word")
         self.result_text.pack(fill="both", expand=True, padx=10, pady=6)
         self.result_text.configure(state="disabled")
+
+        ttk.Label(self,
+                  text="Copyright © 2026 CTCI Beijing Co., Ltd.",
+                  foreground="#999999",
+                  font=("Arial", 8)).pack(side="bottom", pady=(2, 6))
 
     # ---------------- 交互逻辑 ----------------
 
