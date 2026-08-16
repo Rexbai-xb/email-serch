@@ -1,6 +1,5 @@
 name: Build Windows EXE
 
-# 触发方式：push 代码时自动运行，或者在 Actions 页面手动点 "Run workflow"
 on:
   workflow_dispatch:
   push:
@@ -8,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest   # 关键：使用 GitHub 提供的真实 Windows 云端环境打包
+    runs-on: windows-latest
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
@@ -26,7 +25,7 @@ jobs:
       - name: 用 PyInstaller 打包成单文件 exe
         working-directory: pst_tool
         run: |
-          pyinstaller --onefile --windowed --name "PST邮件搜索工具" --add-data "assets;assets" pst_search_tool.py
+          pyinstaller --onefile --windowed --name "PST邮件搜索工具" --add-data "assets;assets" --hidden-import win32com.client --hidden-import pythoncom --hidden-import pywintypes pst_search_tool.py
 
       - name: 上传打包结果
         uses: actions/upload-artifact@v4
