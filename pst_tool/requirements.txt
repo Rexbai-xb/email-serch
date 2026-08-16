@@ -1,4 +1,4 @@
-# 在 Windows 电脑上安装以下依赖（用于开发/打包，最终用户运行 exe 不需要装这些）
-libpff-python-windows==20231205
+pywin32
+libpff-python-windows
 openpyxl>=3.1
 pyinstaller>=6.0
