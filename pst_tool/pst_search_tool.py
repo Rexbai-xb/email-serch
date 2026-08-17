@@ -1,13 +1,12 @@
-
 # -*- coding: utf-8 -*-
 """
-Outlook PST 邮件搜索工具 v4
-- 主引擎：win32com 调用 Outlook COM（Outlook 开着也能用，保存真正的 .msg 格式，不乱码）
-- 备用引擎：libpff（Outlook 未开启时使用）
+Outlook PST 邮件搜索工具 v5
+- 主引擎：win32com（Outlook 开着时使用，保存 .msg 格式，不乱码）
+- 备用引擎：libpff（Outlook 未开时使用，保存 .eml 格式）
 依赖：pip install pywin32 openpyxl libpff-python-windows
 """
 
-import os, sys, threading, traceback, datetime, re
+import os, sys, threading, traceback, datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -106,6 +105,37 @@ def safe_str(v):
     return str(v)
 
 
+def com_date_to_datetime(com_date):
+    """
+    将 win32com 返回的 PyTime / datetime / pywintypes.datetime
+    统一转为 Python 标准 datetime 对象。
+    """
+    if com_date is None:
+        return None
+    # 已经是标准 datetime
+    if isinstance(com_date, datetime.datetime):
+        return com_date
+    # pywintypes.datetime（继承自 datetime，但 strftime 有时会失败）
+    try:
+        return datetime.datetime(
+            com_date.year, com_date.month, com_date.day,
+            com_date.hour, com_date.minute, com_date.second)
+    except Exception:
+        pass
+    # 其他情况：尝试直接格式化再解析
+    try:
+        s = str(com_date)
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%m/%d/%Y %H:%M:%S',
+                    '%Y/%m/%d %H:%M:%S'):
+            try:
+                return datetime.datetime.strptime(s[:19], fmt)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
 # ── 搜索条件 ──────────────────────────────────────────────────────────
 class SearchCriteria:
     def __init__(self, subject_kw='', from_kw='', to_kw='',
@@ -113,19 +143,18 @@ class SearchCriteria:
         self.subject_kw    = subject_kw.strip().lower()
         self.from_kw       = from_kw.strip().lower()
         self.to_kw         = to_kw.strip().lower()
-        self.date_start    = date_start   # datetime.date
-        self.date_end      = date_end     # datetime.date
+        self.date_start    = date_start
+        self.date_end      = date_end
         self.folder_filter = folder_filter.strip()
 
 
 # ── 分组管理（边搜索边写文件） ────────────────────────────────────────
 class GroupManager:
-    """管理主题分组，支持边搜索边保存邮件"""
     def __init__(self, eml_dir, export_eml):
-        self.eml_dir    = eml_dir
-        self.export_eml = export_eml
-        self.groups     = {}   # norm_subject -> {earliest, latest, senders, count, folder_name}
-        self.order      = []
+        self.eml_dir     = eml_dir
+        self.export_eml  = export_eml
+        self.groups      = {}
+        self.order       = []
         self._used_names = {}
 
     def _get_folder_name(self, norm_subj):
@@ -135,10 +164,6 @@ class GroupManager:
         return base if cnt == 0 else f'{base}_{cnt}'
 
     def add(self, rec_date, norm_subj, sender, save_fn):
-        """
-        添加一封邮件到分组。
-        save_fn(folder_abs) 负责实际写文件，由调用方传入。
-        """
         key = norm_subj or '(无主题)'
         if key not in self.groups:
             fname = self._get_folder_name(key)
@@ -161,7 +186,7 @@ class GroupManager:
         if sender:
             g['senders'].add(sender)
         g['count'] += 1
-        if self.export_eml:
+        if self.export_eml and save_fn:
             folder_abs = os.path.join(self.eml_dir, g['folder'])
             try:
                 save_fn(folder_abs)
@@ -170,70 +195,54 @@ class GroupManager:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 引擎一：win32com（Outlook COM，推荐）
+# 引擎一：win32com
 # ══════════════════════════════════════════════════════════════════════
-
-def _outlook_is_running():
-    try:
-        import psutil
-        return any(p.name().lower() == 'outlook.exe'
-                   for p in psutil.process_iter(['name']))
-    except Exception:
-        return False
-
-
 def _find_pst_store(outlook, pst_path):
-    """在已加载的 Outlook 里找到对应 pst_path 的 Store"""
     norm = os.path.normpath(pst_path).lower()
     stores = outlook.Session.Stores
     for i in range(1, stores.Count + 1):
         st = stores.Item(i)
         try:
-            fp = os.path.normpath(st.FilePath).lower()
-            if fp == norm:
+            if os.path.normpath(st.FilePath).lower() == norm:
                 return st
         except Exception:
             continue
     return None
 
 
-def _walk_com_folder(folder, parts, criteria, gm, status_cb, counter):
-    """递归遍历 COM 文件夹，边遍历边过滤边保存"""
-    path_str = '/'.join(parts) or '根目录'
-
-    # 构建 Outlook Restrict 过滤字符串（时间范围，大幅减少遍历量）
+def _walk_com_folder(folder, criteria, gm, status_cb, counter):
     items = folder.Items
-    items.Sort('[ReceivedTime]', True)   # 按时间降序，有利于早退
+    items.Sort('[ReceivedTime]')
 
-    restrict_parts = []
+    # 用 Restrict 按时间范围预过滤，大幅减少遍历量
+    filters = []
     if criteria.date_start:
-        ds = criteria.date_start.strftime('%Y-%m-%d 00:00')
-        restrict_parts.append(f"[ReceivedTime] >= '{ds}'")
+        filters.append(
+            f"[ReceivedTime] >= '{criteria.date_start.strftime('%Y-%m-%d')} 00:00'")
     if criteria.date_end:
-        de = criteria.date_end.strftime('%Y-%m-%d 23:59')
-        restrict_parts.append(f"[ReceivedTime] <= '{de}'")
-    if restrict_parts:
-        items = items.Restrict(' AND '.join(restrict_parts))
+        filters.append(
+            f"[ReceivedTime] <= '{criteria.date_end.strftime('%Y-%m-%d')} 23:59'")
+    if filters:
+        items = items.Restrict(' AND '.join(filters))
 
     try:
         item = items.GetFirst()
         while item is not None:
             try:
-                if getattr(item, 'Class', None) == 43:   # olMail
+                if getattr(item, 'Class', None) == 43:  # olMail
                     counter[0] += 1
                     if status_cb and counter[0] % 20 == 0:
                         status_cb(f'正在扫描第 {counter[0]} 封邮件 ...')
 
                     subj    = safe_str(getattr(item, 'Subject', ''))
                     sender  = safe_str(getattr(item, 'SenderName', ''))
-                    to_addr = safe_str(getattr(item, 'To', ''))
-                    cc_addr = safe_str(getattr(item, 'CC', ''))
+                    to_str  = safe_str(getattr(item, 'To', ''))
+                    cc_str  = safe_str(getattr(item, 'CC', ''))
+
+                    # ── 关键修复：正确转换 COM 日期 ──
                     try:
-                        recv = item.ReceivedTime
-                        if hasattr(recv, 'date'):
-                            rec_date = recv
-                        else:
-                            rec_date = None
+                        raw_date = item.ReceivedTime
+                        rec_date = com_date_to_datetime(raw_date)
                     except Exception:
                         rec_date = None
 
@@ -250,21 +259,22 @@ def _walk_com_folder(folder, parts, criteria, gm, status_cb, counter):
                            criteria.from_kw not in se.lower():
                             ok = False
                     if ok and criteria.to_kw:
-                        pool = (to_addr + ' ' + cc_addr).lower()
+                        pool = (to_str + ' ' + cc_str).lower()
                         if criteria.to_kw not in pool:
                             ok = False
 
                     if ok:
                         norm_subj = normalize_subject(subj)
-                        ts = recv.strftime('%Y%m%d_%H%M%S') if rec_date else '无日期'
+                        ts = rec_date.strftime('%Y%m%d_%H%M%S') \
+                            if rec_date else '无日期'
                         fname = f"{ts}_{sanitize_filename(norm_subj, 40)}.msg"
+                        captured = item
 
-                        captured_item = item   # 闭包捕获
-
-                        def save_fn(folder_abs, _item=captured_item, _fname=fname):
-                            fpath = os.path.join(folder_abs, _fname)
-                            if not os.path.exists(fpath):
-                                _item.SaveAs(win_long(fpath))
+                        def save_fn(folder_abs,
+                                    _it=captured, _fn=fname):
+                            fp = os.path.join(folder_abs, _fn)
+                            if not os.path.exists(fp):
+                                _it.SaveAs(win_long(fp))
 
                         gm.add(rec_date, norm_subj, sender, save_fn)
 
@@ -282,51 +292,52 @@ def _walk_com_folder(folder, parts, criteria, gm, status_cb, counter):
         for i in range(1, folder.Folders.Count + 1):
             sub = folder.Folders.Item(i)
             sub_name = safe_str(getattr(sub, 'Name', ''))
-            if criteria.folder_filter and sub_name != criteria.folder_filter:
-                # 还要往深处找
-                _walk_com_folder(sub, parts + [sub_name], criteria, gm,
-                                 status_cb, counter)
+            if criteria.folder_filter:
+                if sub_name == criteria.folder_filter:
+                    _walk_com_folder(sub, criteria, gm, status_cb, counter)
+                else:
+                    # 继续向深处找目标文件夹
+                    _walk_com_folder_find(sub, criteria, gm, status_cb, counter)
             else:
-                _walk_com_folder(sub, parts + [sub_name], criteria, gm,
-                                 status_cb, counter)
+                _walk_com_folder(sub, criteria, gm, status_cb, counter)
+    except Exception:
+        pass
+
+
+def _walk_com_folder_find(folder, criteria, gm, status_cb, counter):
+    """只找名称匹配的子文件夹，不扫描当前层邮件"""
+    try:
+        for i in range(1, folder.Folders.Count + 1):
+            sub = folder.Folders.Item(i)
+            sub_name = safe_str(getattr(sub, 'Name', ''))
+            if sub_name == criteria.folder_filter:
+                _walk_com_folder(sub, criteria, gm, status_cb, counter)
+            else:
+                _walk_com_folder_find(sub, criteria, gm, status_cb, counter)
     except Exception:
         pass
 
 
 def run_search_com(pst_path, criteria, gm, status_cb=None):
-    """用 Outlook COM 搜索，Outlook 必须在运行"""
     pythoncom.CoInitialize()
     try:
         outlook = win32com.client.Dispatch('Outlook.Application')
         store   = _find_pst_store(outlook, pst_path)
         if store is None:
-            # PST 没有在 Outlook 里加载，尝试临时添加
             outlook.Session.AddStore(pst_path)
             store = _find_pst_store(outlook, pst_path)
         if store is None:
             raise RuntimeError(
-                f'无法在 Outlook 中找到或加载该 PST 文件：{pst_path}\n'
-                '请先在 Outlook 里手动打开这个 PST 文件（文件→打开和导出→打开 Outlook 数据文件）')
+                f'无法在 Outlook 中找到该 PST：{pst_path}\n'
+                '请先在 Outlook 里手动打开这个 PST 文件。')
 
         root    = store.GetRootFolder()
         counter = [0]
 
         if criteria.folder_filter:
-            # 只搜索指定名称的子文件夹
-            def search_named(folder):
-                name = safe_str(getattr(folder, 'Name', ''))
-                if name == criteria.folder_filter:
-                    _walk_com_folder(folder, [name], criteria, gm,
-                                     status_cb, counter)
-                else:
-                    try:
-                        for i in range(1, folder.Folders.Count + 1):
-                            search_named(folder.Folders.Item(i))
-                    except Exception:
-                        pass
-            search_named(root)
+            _walk_com_folder_find(root, criteria, gm, status_cb, counter)
         else:
-            _walk_com_folder(root, [], criteria, gm, status_cb, counter)
+            _walk_com_folder(root, criteria, gm, status_cb, counter)
 
         return counter[0]
     finally:
@@ -334,28 +345,26 @@ def run_search_com(pst_path, criteria, gm, status_cb=None):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 引擎二：libpff（备用，Outlook 未开启时）
+# 引擎二：libpff（备用）
 # ══════════════════════════════════════════════════════════════════════
-
 def run_search_pff(pst_path, criteria, gm, status_cb=None):
-    """用 libpff 搜索（不依赖 Outlook）"""
     pst_path = os.path.normpath(os.path.abspath(pst_path))
     pf = pypff.file()
     pf.open(pst_path)
     root    = pf.get_root_folder()
     counter = [0]
 
-    def get_date(message):
+    def get_date(msg):
         for attr in ('delivery_time', 'client_submit_time', 'creation_time'):
             try:
-                v = getattr(message, attr, None)
+                v = getattr(msg, attr, None)
                 if v:
                     return v
             except Exception:
                 pass
         return None
 
-    def walk(folder, parts):
+    def walk(folder):
         for msg in folder.sub_messages:
             counter[0] += 1
             if status_cb and counter[0] % 25 == 0:
@@ -363,12 +372,12 @@ def run_search_pff(pst_path, criteria, gm, status_cb=None):
             try:
                 subj    = safe_str(getattr(msg, 'subject', ''))
                 sender  = safe_str(getattr(msg, 'sender_name', ''))
-                to_addr = safe_str(getattr(msg, 'display_to', ''))
-                cc_addr = safe_str(getattr(msg, 'display_cc', ''))
+                to_str  = safe_str(getattr(msg, 'display_to', ''))
+                cc_str  = safe_str(getattr(msg, 'display_cc', ''))
                 headers = safe_str(getattr(msg, 'transport_headers', ''))
                 rec_date = get_date(msg)
 
-                # 时间范围快速过滤
+                # 时间范围快速跳过
                 if (criteria.date_start or criteria.date_end) and rec_date:
                     d = rec_date.date() if hasattr(rec_date, 'date') else None
                     if d:
@@ -377,7 +386,6 @@ def run_search_pff(pst_path, criteria, gm, status_cb=None):
                         if criteria.date_end and d > criteria.date_end:
                             continue
 
-                # 条件匹配
                 ok = True
                 ns = normalize_subject(subj).lower()
                 if criteria.subject_kw and \
@@ -389,27 +397,27 @@ def run_search_pff(pst_path, criteria, gm, status_cb=None):
                        criteria.from_kw not in headers.lower():
                         ok = False
                 if ok and criteria.to_kw:
-                    pool = (to_addr + ' ' + cc_addr + ' ' + headers).lower()
+                    pool = (to_str + ' ' + cc_str + ' ' + headers).lower()
                     if criteria.to_kw not in pool:
                         ok = False
 
                 if ok:
                     norm_subj = normalize_subject(subj)
-                    ts = rec_date.strftime('%Y%m%d_%H%M%S') if rec_date else '无日期'
+                    ts = rec_date.strftime('%Y%m%d_%H%M%S') \
+                        if rec_date else '无日期'
                     fname = f"{ts}_{sanitize_filename(norm_subj, 40)}.eml"
-
-                    # libpff 只能导出 eml
                     plain = safe_str(getattr(msg, 'plain_text_body', ''))
                     html  = safe_str(getattr(msg, 'html_body', ''))
 
-                    def save_fn(folder_abs, _subj=subj, _sender=sender,
-                                _to=to_addr, _cc=cc_addr, _dt=rec_date,
-                                _plain=plain, _html=html, _fname=fname):
+                    def save_fn(folder_abs,
+                                _s=subj, _sndr=sender, _to=to_str,
+                                _cc=cc_str, _dt=rec_date,
+                                _p=plain, _h=html, _fn=fname):
                         import quopri
-                        lines = ['MIME-Version: 1.0']
-                        lines.append(f'Subject: {_subj}')
-                        lines.append(f'From: {_sender}')
-                        lines.append(f'To: {_to}')
+                        lines = ['MIME-Version: 1.0',
+                                 f'Subject: {_s}',
+                                 f'From: {_sndr}',
+                                 f'To: {_to}']
                         if _cc:
                             lines.append(f'Cc: {_cc}')
                         if _dt:
@@ -418,22 +426,17 @@ def run_search_pff(pst_path, criteria, gm, status_cb=None):
                                 lines.append(f'Date: {format_datetime(_dt)}')
                             except Exception:
                                 pass
-                        if _html:
-                            lines.append('Content-Type: text/html; charset="utf-8"')
-                            lines.append('Content-Transfer-Encoding: quoted-printable')
-                            lines.append('')
-                            lines.append(quopri.encodestring(
-                                _html.encode('utf-8')).decode('ascii'))
+                        if _h:
+                            lines += ['Content-Type: text/html; charset="utf-8"',
+                                      'Content-Transfer-Encoding: quoted-printable', '',
+                                      quopri.encodestring(_h.encode('utf-8')).decode('ascii')]
                         else:
-                            lines.append('Content-Type: text/plain; charset="utf-8"')
-                            lines.append('Content-Transfer-Encoding: quoted-printable')
-                            lines.append('')
-                            lines.append(quopri.encodestring(
-                                (_plain or '(无正文)').encode('utf-8')).decode('ascii'))
-                        content = '\r\n'.join(lines).encode('utf-8')
-                        fpath = os.path.join(folder_abs, _fname)
-                        with open(win_long(fpath), 'wb') as f:
-                            f.write(content)
+                            lines += ['Content-Type: text/plain; charset="utf-8"',
+                                      'Content-Transfer-Encoding: quoted-printable', '',
+                                      quopri.encodestring(
+                                          (_p or '(无正文)').encode('utf-8')).decode('ascii')]
+                        with open(win_long(os.path.join(folder_abs, _fn)), 'wb') as f:
+                            f.write('\r\n'.join(lines).encode('utf-8'))
 
                     gm.add(rec_date, norm_subj, sender, save_fn)
             except Exception:
@@ -443,44 +446,41 @@ def run_search_pff(pst_path, criteria, gm, status_cb=None):
             name = safe_str(getattr(sub, 'name', '')) or '未命名'
             if criteria.folder_filter:
                 if name == criteria.folder_filter:
-                    walk(sub, parts + [name])
+                    walk(sub)
                 else:
-                    walk_find(sub, parts + [name])
+                    walk_find(sub)
             else:
-                walk(sub, parts + [name])
+                walk(sub)
 
-    def walk_find(folder, parts):
-        """只找名字匹配的子文件夹"""
+    def walk_find(folder):
         for sub in folder.sub_folders:
             name = safe_str(getattr(sub, 'name', '')) or '未命名'
             if name == criteria.folder_filter:
-                walk(sub, parts + [name])
+                walk(sub)
             else:
-                walk_find(sub, parts + [name])
+                walk_find(sub)
 
     try:
         if criteria.folder_filter:
-            walk_find(root, [])
+            walk_find(root)
         else:
-            walk(root, [])
+            walk(root)
     finally:
-        if status_cb:
-            status_cb(f'扫描完成，共 {counter[0]} 封邮件')
         pf.close()
 
     return counter[0]
 
 
-# ── 主搜索入口（自动选引擎） ──────────────────────────────────────────
+# ── 主搜索入口 ────────────────────────────────────────────────────────
 def run_search(pst_path, criteria, gm, status_cb=None):
     if HAS_WIN32:
-        status_cb and status_cb('使用 Outlook COM 引擎搜索（支持 .msg 格式保存）...')
+        status_cb and status_cb('使用 Outlook COM 引擎（保存为 .msg 格式）...')
         return run_search_com(pst_path, criteria, gm, status_cb)
     elif HAS_PYPFF:
-        status_cb and status_cb('Outlook 未检测到，使用 libpff 引擎搜索...')
+        status_cb and status_cb('使用 libpff 引擎（保存为 .eml 格式）...')
         return run_search_pff(pst_path, criteria, gm, status_cb)
     else:
-        raise RuntimeError('未安装任何搜索引擎，请执行：pip install pywin32 openpyxl')
+        raise RuntimeError('未安装搜索引擎，请执行：pip install pywin32 openpyxl')
 
 
 # ── 生成 Excel 报表 ───────────────────────────────────────────────────
@@ -490,46 +490,66 @@ def export_excel(gm, total, output_dir, status_cb=None):
 
     wb = openpyxl.Workbook()
 
-    # Sheet1：检索主题邮件（5列，主题列带超链接）
+    # ── Sheet1：检索主题邮件（5列）──────────────────────────────────
     ws = wb.active
     ws.title = '检索主题邮件'
-    for cell, v in zip(ws[1], ['序号', '主题', '接收时间', '最新邮件时间', '邮件发件人']):
-        cell.value = v
-        cell.font  = Font(bold=True, color='FFFFFF')
-        cell.fill  = PatternFill('solid', fgColor='4472C4')
-        cell.alignment = Alignment(horizontal='center')
 
+    # 表头样式
+    header_font = Font(bold=True, color='FFFFFF')
+    header_fill = PatternFill('solid', fgColor='4472C4')
+    header_align = Alignment(horizontal='center')
+
+    headers = ['序号', '主题', '接收时间', '最新邮件时间', '邮件发件人']
+    for col_idx, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx, value=h)
+        cell.font      = header_font
+        cell.fill      = header_fill
+        cell.alignment = header_align
+
+    # 数据行
     for g_idx, key in enumerate(gm.order, 1):
         if status_cb and g_idx % 50 == 0:
             status_cb(f'正在写入报表第 {g_idx} 行...')
         g = gm.groups[key]
-        earliest = g['earliest'].strftime('%Y-%m-%d %H:%M') if g['earliest'] else ''
-        latest   = g['latest'].strftime('%Y-%m-%d %H:%M') if g['latest'] else ''
-        senders  = '; '.join(sorted(g['senders']))
-        ws.append([g_idx, key, earliest, latest, senders])
-        row = ws.max_row
+
+        # 日期格式化（已是标准 datetime，直接格式化）
+        earliest_str = g['earliest'].strftime('%Y-%m-%d %H:%M') \
+            if g['earliest'] else ''
+        latest_str = g['latest'].strftime('%Y-%m-%d %H:%M') \
+            if g['latest'] else ''
+        senders_str = '; '.join(sorted(g['senders']))
+
+        ws.cell(row=g_idx + 1, column=1, value=g_idx)
+        ws.cell(row=g_idx + 1, column=2, value=key)
+        ws.cell(row=g_idx + 1, column=3, value=earliest_str)
+        ws.cell(row=g_idx + 1, column=4, value=latest_str)
+        ws.cell(row=g_idx + 1, column=5, value=senders_str)
+
+        # 主题列加超链接
         if gm.export_eml:
-            folder_abs = os.path.abspath(os.path.join(gm.eml_dir, g['folder']))
-            link_url   = 'file:///' + folder_abs.replace('\\', '/')
-            c = ws.cell(row=row, column=2)
+            folder_abs = os.path.abspath(
+                os.path.join(gm.eml_dir, g['folder']))
+            link_url = 'file:///' + folder_abs.replace('\\', '/')
+            c = ws.cell(row=g_idx + 1, column=2)
             c.hyperlink = link_url
             c.font = Font(color='0563C1', underline='single')
 
-    for col, w in zip('ABCDE', [6, 44, 18, 18, 32]):
+    for col, w in zip('ABCDE', [6, 46, 18, 18, 34]):
         ws.column_dimensions[col].width = w
 
-    # Sheet2：统计汇总
+    # ── Sheet2：统计汇总 ─────────────────────────────────────────────
     ws2 = wb.create_sheet('统计汇总')
     total_matched = sum(g['count'] for g in gm.groups.values())
     rate = (total_matched / total * 100) if total else 0
-    for r in [
+    rows = [
         ('生成时间',  datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
         ('PST邮件总数', total),
         ('匹配邮件数',  total_matched),
         ('匹配率',      f'{rate:.2f}%'),
         ('识别主题数',  len(gm.order)),
         ('搜索引擎',    'Outlook COM (.msg)' if HAS_WIN32 else 'libpff (.eml)'),
-    ]:
+    ]
+    for r in rows:
         ws2.append(r)
     ws2.column_dimensions['A'].width = 18
     ws2.column_dimensions['B'].width = 28
@@ -546,7 +566,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('Outlook PST 邮件搜索工具')
-        self.geometry('680x680')
+        self.geometry('680x700')
         self.resizable(False, False)
 
         self.pst_path_var   = tk.StringVar()
@@ -572,7 +592,13 @@ class App(tk.Tk):
     def _build_ui(self):
         pad = {'padx': 10, 'pady': 5}
 
-        # 顶部 logo
+        # ── 版权（先 pack，确保始终显示在底部）──
+        ttk.Label(self,
+                  text='Copyright © 2026 CTCI Beijing Co., Ltd.',
+                  foreground='#999999',
+                  font=('Arial', 8)).pack(side='bottom', pady=(2, 6))
+
+        # ── 顶部 logo ──
         frm_hdr = ttk.Frame(self)
         frm_hdr.pack(fill='x', padx=14, pady=(10, 4))
         if self.logo_img:
@@ -581,7 +607,7 @@ class App(tk.Tk):
                   font=('Microsoft YaHei UI', 11, 'bold'),
                   foreground='#3c3c3c').pack(side='right', padx=4)
 
-        # 第一步
+        # ── 第一步 ──
         frm_file = ttk.LabelFrame(self, text='第一步：选择 PST 文件与输出文件夹')
         frm_file.pack(fill='x', **pad)
 
@@ -613,41 +639,49 @@ class App(tk.Tk):
                   foreground='#a15c00').grid(
             row=4, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 5))
 
-        # 第二步
+        # ── 第二步 ──
         frm_s = ttk.LabelFrame(self, text='第二步：设置搜索条件（可任意组合，留空不限制）')
         frm_s.pack(fill='x', **pad)
 
-        ttk.Label(frm_s, text='主题关键字：').grid(row=0, column=0, sticky='w', padx=6, pady=5)
+        ttk.Label(frm_s, text='主题关键字：').grid(
+            row=0, column=0, sticky='w', padx=6, pady=5)
         ttk.Entry(frm_s, textvariable=self.subject_var, width=38).grid(
             row=0, column=1, columnspan=2, sticky='w', pady=5)
 
-        ttk.Label(frm_s, text='发件人包含：').grid(row=1, column=0, sticky='w', padx=6, pady=5)
+        ttk.Label(frm_s, text='发件人包含：').grid(
+            row=1, column=0, sticky='w', padx=6, pady=5)
         ttk.Entry(frm_s, textvariable=self.from_var, width=38).grid(
             row=1, column=1, columnspan=2, sticky='w', pady=5)
 
-        ttk.Label(frm_s, text='收件人/抄送：').grid(row=2, column=0, sticky='w', padx=6, pady=5)
+        ttk.Label(frm_s, text='收件人/抄送：').grid(
+            row=2, column=0, sticky='w', padx=6, pady=5)
         ttk.Entry(frm_s, textvariable=self.to_var, width=38).grid(
             row=2, column=1, columnspan=2, sticky='w', pady=5)
 
-        ttk.Label(frm_s, text='日期范围：').grid(row=3, column=0, sticky='w', padx=6, pady=5)
+        ttk.Label(frm_s, text='日期范围：').grid(
+            row=3, column=0, sticky='w', padx=6, pady=5)
         ttk.Entry(frm_s, textvariable=self.date_start_var, width=14).grid(
             row=3, column=1, sticky='w', pady=5)
-        ttk.Label(frm_s, text='至').grid(row=3, column=1, padx=(112, 0), sticky='w')
+        ttk.Label(frm_s, text='至').grid(
+            row=3, column=1, padx=(112, 0), sticky='w')
         ttk.Entry(frm_s, textvariable=self.date_end_var, width=14).grid(
             row=3, column=2, sticky='w', pady=5)
         ttk.Label(frm_s, text='格式：YYYY-MM-DD（可只填一端）',
                   foreground='#666666').grid(
             row=4, column=0, columnspan=3, sticky='w', padx=6)
 
-        ttk.Checkbutton(frm_s,
-                        text='将匹配邮件另存为文件（按主题分子文件夹，Outlook开启时保存为.msg）',
-                        variable=self.export_eml_var).grid(
+        ttk.Checkbutton(
+            frm_s,
+            text='将匹配邮件另存为文件（按主题分子文件夹，Outlook 开启时保存为 .msg）',
+            variable=self.export_eml_var).grid(
             row=5, column=0, columnspan=3, sticky='w', padx=6, pady=(6, 4))
 
+        # ── 搜索按钮 ──
         self.search_btn = ttk.Button(self, text='开始搜索并生成报表',
                                      command=self.start_search)
         self.search_btn.pack(pady=8)
 
+        # ── 进度区域（最后 pack，expand 占满剩余空间）──
         frm_prog = ttk.LabelFrame(self, text='进度与结果')
         frm_prog.pack(fill='both', expand=True, **pad)
 
@@ -655,18 +689,14 @@ class App(tk.Tk):
         self.progress.pack(fill='x', padx=10, pady=8)
 
         ttk.Label(frm_prog, textvariable=self.status_var,
-                  wraplength=600, justify='left').pack(anchor='w', padx=10, pady=2)
+                  wraplength=600, justify='left').pack(
+            anchor='w', padx=10, pady=2)
 
         self.result_text = tk.Text(frm_prog, height=7, wrap='word')
         self.result_text.pack(fill='both', expand=True, padx=10, pady=6)
         self.result_text.configure(state='disabled')
 
-        # 版权
-        ttk.Label(self,
-                  text='Copyright © 2026 CTCI Beijing Co., Ltd.',
-                  foreground='#999999',
-                  font=('Arial', 8)).pack(side='bottom', pady=(2, 6))
-
+    # ── 交互 ──────────────────────────────────────────────────────────
     def choose_pst(self):
         path = filedialog.askopenfilename(
             title='选择 PST 文件',
@@ -714,7 +744,7 @@ class App(tk.Tk):
             return
         if not HAS_WIN32 and not HAS_PYPFF:
             messagebox.showerror('缺少依赖',
-                '请先执行：pip install pywin32 openpyxl libpff-python-windows')
+                '请执行：pip install pywin32 openpyxl libpff-python-windows')
             return
 
         try:
@@ -753,18 +783,19 @@ class App(tk.Tk):
                 mkdirs(eml_dir)
 
             gm = GroupManager(eml_dir, export_eml)
-
             self.set_status('正在搜索，匹配到的邮件将实时保存...')
             total = run_search(pst_path, criteria, gm, self.set_status)
 
             self.set_status('搜索完成，正在生成 Excel 报表...')
-            report, rate, matched = export_excel(gm, total, output_dir, self.set_status)
+            report, rate, matched = export_excel(
+                gm, total, output_dir, self.set_status)
 
             self.set_status('完成！')
             engine = 'Outlook COM (.msg)' if HAS_WIN32 else 'libpff (.eml)'
             self.append_result(f'搜索引擎：{engine}')
             self.append_result(f'PST 文件：{pst_path}')
-            self.append_result(f'扫描总数：{total}　匹配：{matched}　匹配率：{rate:.2f}%')
+            self.append_result(
+                f'扫描总数：{total}　匹配：{matched}　匹配率：{rate:.2f}%')
             self.append_result(f'识别主题（线程）数：{len(gm.order)}')
             self.append_result(f'报表：{report}')
             if export_eml:
@@ -772,7 +803,7 @@ class App(tk.Tk):
 
             messagebox.showinfo('搜索完成',
                 f'扫描 {total} 封，匹配 {matched} 封，匹配率 {rate:.2f}%\n'
-                f'识别主题数：{len(gm.order)}\n报表已保存到：\n{output_dir}')
+                f'识别主题数：{len(gm.order)}\n报表保存到：\n{output_dir}')
         except Exception as e:
             traceback.print_exc()
             self.set_status('出现错误')
