@@ -107,28 +107,31 @@ def safe_str(v):
 
 def com_date_to_datetime(com_date):
     """
-    将 win32com 返回的 PyTime / datetime / pywintypes.datetime
-    统一转为 Python 标准 datetime 对象。
+    将 win32com / pywintypes.datetime 转为纯 Python 标准 datetime（无时区）。
+    pywintypes.datetime 继承自 datetime.datetime 但携带时区信息，
+    在某些系统/时区下 strftime 会崩溃，必须强制用属性重建为无时区对象。
     """
     if com_date is None:
         return None
-    # 已经是标准 datetime
-    if isinstance(com_date, datetime.datetime):
-        return com_date
-    # pywintypes.datetime（继承自 datetime，但 strftime 有时会失败）
+    # 用 int() 强制提取各字段，兼容 pywintypes.datetime 和标准 datetime
     try:
         return datetime.datetime(
-            com_date.year, com_date.month, com_date.day,
-            com_date.hour, com_date.minute, com_date.second)
+            int(com_date.year),
+            int(com_date.month),
+            int(com_date.day),
+            int(com_date.hour),
+            int(com_date.minute),
+            int(com_date.second),
+        )
     except Exception:
         pass
-    # 其他情况：尝试直接格式化再解析
+    # 兜底：转字符串再解析
     try:
-        s = str(com_date)
+        s = str(com_date)[:19]
         for fmt in ('%Y-%m-%d %H:%M:%S', '%m/%d/%Y %H:%M:%S',
                     '%Y/%m/%d %H:%M:%S'):
             try:
-                return datetime.datetime.strptime(s[:19], fmt)
+                return datetime.datetime.strptime(s, fmt)
             except Exception:
                 pass
     except Exception:
