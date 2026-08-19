@@ -108,30 +108,36 @@ def safe_str(v):
 def com_date_to_datetime(com_date):
     """
     将 win32com / pywintypes.datetime 转为纯 Python 标准 datetime（无时区）。
-    pywintypes.datetime 继承自 datetime.datetime 但携带时区信息，
-    在某些系统/时区下 strftime 会崩溃，必须强制用属性重建为无时区对象。
+    策略：多种方法依次尝试，任一成功即返回。
     """
     if com_date is None:
         return None
-    # 用 int() 强制提取各字段，兼容 pywintypes.datetime 和标准 datetime
+    # 方法1：直接用属性重建（pywintypes.datetime 的属性是可靠的）
     try:
-        return datetime.datetime(
-            int(com_date.year),
-            int(com_date.month),
-            int(com_date.day),
-            int(com_date.hour),
-            int(com_date.minute),
-            int(com_date.second),
-        )
+        y  = com_date.year
+        mo = com_date.month
+        d  = com_date.day
+        h  = com_date.hour
+        mi = com_date.minute
+        s  = com_date.second
+        return datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), int(s))
     except Exception:
         pass
-    # 兜底：转字符串再解析
+    # 方法2：用 win32com Format 方法转成字符串再解析（最可靠的备用方案）
     try:
-        s = str(com_date)[:19]
-        for fmt in ('%Y-%m-%d %H:%M:%S', '%m/%d/%Y %H:%M:%S',
-                    '%Y/%m/%d %H:%M:%S'):
+        import pywintypes
+        s = pywintypes.Time(com_date).Format('%Y-%m-%d %H:%M:%S')
+        return datetime.datetime.strptime(s, '%Y-%m-%d %H:%M:%S')
+    except Exception:
+        pass
+    # 方法3：直接 str() 后解析
+    try:
+        s = str(com_date)
+        for fmt in ('%Y-%m-%d %H:%M:%S%z', '%Y-%m-%d %H:%M:%S',
+                    '%m/%d/%Y %H:%M:%S', '%Y/%m/%d %H:%M:%S'):
             try:
-                return datetime.datetime.strptime(s, fmt)
+                dt = datetime.datetime.strptime(s[:19], fmt[:len('%Y-%m-%d %H:%M:%S')])
+                return dt
             except Exception:
                 pass
     except Exception:
@@ -186,7 +192,7 @@ class GroupManager:
                 g['earliest'] = rec_date
             if g['latest'] is None or rec_date > g['latest']:
                 g['latest'] = rec_date
-        if sender:
+        if sender and not g['senders']:   # 只记录第一封邮件的发件人
             g['senders'].add(sender)
         g['count'] += 1
         if self.export_eml and save_fn:
@@ -270,14 +276,19 @@ def _walk_com_folder(folder, criteria, gm, status_cb, counter):
                         norm_subj = normalize_subject(subj)
                         ts = rec_date.strftime('%Y%m%d_%H%M%S') \
                             if rec_date else '无日期'
-                        fname = f"{ts}_{sanitize_filename(norm_subj, 40)}.msg"
+                        fname_base = f"{ts}_{sanitize_filename(norm_subj, 40)}"
                         captured = item
+                        captured_base = fname_base
 
                         def save_fn(folder_abs,
-                                    _it=captured, _fn=fname):
-                            fp = os.path.join(folder_abs, _fn)
-                            if not os.path.exists(fp):
-                                _it.SaveAs(win_long(fp))
+                                    _it=captured, _base=captured_base):
+                            # 加序号后缀避免同名覆盖（尤其是无日期时）
+                            fp = os.path.join(folder_abs, _base + '.msg')
+                            n = 1
+                            while os.path.exists(win_long(fp)):
+                                fp = os.path.join(folder_abs, f'{_base}_{n}.msg')
+                                n += 1
+                            _it.SaveAs(win_long(fp))
 
                         gm.add(rec_date, norm_subj, sender, save_fn)
 
@@ -502,7 +513,7 @@ def export_excel(gm, total, output_dir, status_cb=None):
     header_fill = PatternFill('solid', fgColor='4472C4')
     header_align = Alignment(horizontal='center')
 
-    headers = ['序号', '主题', '接收时间', '最新邮件时间', '邮件发件人']
+    headers = ['序号', '主题', '接收时间', '最新邮件时间', '发件人']
     for col_idx, h in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_idx, value=h)
         cell.font      = header_font
@@ -520,7 +531,7 @@ def export_excel(gm, total, output_dir, status_cb=None):
             if g['earliest'] else ''
         latest_str = g['latest'].strftime('%Y-%m-%d %H:%M') \
             if g['latest'] else ''
-        senders_str = '; '.join(sorted(g['senders']))
+        senders_str = next(iter(g['senders']), '')  # 只取第一封的发件人
 
         ws.cell(row=g_idx + 1, column=1, value=g_idx)
         ws.cell(row=g_idx + 1, column=2, value=key)
